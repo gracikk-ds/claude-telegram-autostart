@@ -125,7 +125,3 @@ session is detached. Use `tmux attach -t claude-tg` to see it.
 
 **Stale `bot.pid` after a crash.** The script detects this via `kill -0` and
 proceeds anyway. If anything looks off, `rm ~/.claude/channels/telegram/bot.pid`.
-
-## License
-
-MIT — see [LICENSE](LICENSE).
