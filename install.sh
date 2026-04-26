@@ -78,16 +78,20 @@ info "project dir: $PROJECT_DIR"
 
 USER_NAME="$(id -un)"
 LABEL="com.${USER_NAME}.claude-telegram"
+WATCHDOG_LABEL="com.${USER_NAME}.claude-telegram-watchdog"
 LOCAL_BIN="$HOME/.local/bin"
 SCRIPT_DST="$LOCAL_BIN/start-claude-telegram.sh"
+WATCHDOG_DST="$LOCAL_BIN/claude-telegram-watchdog.sh"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claude-telegram-autostart"
 CONFIG_DST="$CONFIG_DIR/config.env"
 LAUNCHAGENTS_DIR="$HOME/Library/LaunchAgents"
 PLIST_DST="$LAUNCHAGENTS_DIR/${LABEL}.plist"
+WATCHDOG_PLIST_DST="$LAUNCHAGENTS_DIR/${WATCHDOG_LABEL}.plist"
 LOGS_DIR="$HOME/Library/Logs"
 LAUNCH_PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/bin"
 
-info "label: $LABEL"
+info "label:    $LABEL"
+info "watchdog: $WATCHDOG_LABEL"
 
 run mkdir -p "$LOCAL_BIN" "$CONFIG_DIR" "$LAUNCHAGENTS_DIR" "$LOGS_DIR"
 
@@ -111,62 +115,85 @@ EOF
   fi
 fi
 
-SCRIPT_SRC="$SCRIPT_DIR/bin/start-claude-telegram.sh"
-[ -f "$SCRIPT_SRC" ] || fail "Missing source: $SCRIPT_SRC"
-if [ -f "$SCRIPT_DST" ] && ! diff -q "$SCRIPT_SRC" "$SCRIPT_DST" >/dev/null 2>&1; then
-  if [ "$NON_INTERACTIVE" -eq 0 ]; then
-    warn "Script at $SCRIPT_DST differs from repo version. Overwrite? [y/N]"
-    read -r answer || true
-    case "$answer" in
-      y|Y|yes) ;;
-      *) fail "Aborted by user." ;;
-    esac
+install_script() {
+  local src="$1" dst="$2"
+  [ -f "$src" ] || fail "Missing source: $src"
+  if [ -f "$dst" ] && ! diff -q "$src" "$dst" >/dev/null 2>&1; then
+    if [ "$NON_INTERACTIVE" -eq 0 ]; then
+      warn "Script at $dst differs from repo version. Overwrite? [y/N]"
+      read -r answer || true
+      case "$answer" in
+        y|Y|yes) ;;
+        *) fail "Aborted by user." ;;
+      esac
+    fi
   fi
-fi
-info "installing script → $SCRIPT_DST"
-run cp "$SCRIPT_SRC" "$SCRIPT_DST"
-run chmod +x "$SCRIPT_DST"
+  info "installing script → $dst"
+  run cp "$src" "$dst"
+  run chmod +x "$dst"
+}
 
-PLIST_SRC="$SCRIPT_DIR/launchd/com.user.claude-telegram.plist.template"
-[ -f "$PLIST_SRC" ] || fail "Missing template: $PLIST_SRC"
-info "rendering plist → $PLIST_DST"
-if [ "$DRY_RUN" -eq 0 ]; then
-  sed \
-    -e "s|__LABEL__|$LABEL|g" \
-    -e "s|__SCRIPT__|$SCRIPT_DST|g" \
-    -e "s|__HOME__|$HOME|g" \
-    -e "s|__PATH__|$LAUNCH_PATH|g" \
-    "$PLIST_SRC" > "$PLIST_DST"
-  plutil -lint "$PLIST_DST" >/dev/null || fail "plutil rejected $PLIST_DST"
-fi
+render_plist() {
+  local src="$1" dst="$2" label="$3" script="$4"
+  [ -f "$src" ] || fail "Missing template: $src"
+  info "rendering plist → $dst"
+  if [ "$DRY_RUN" -eq 0 ]; then
+    sed \
+      -e "s|__LABEL__|$label|g" \
+      -e "s|__SCRIPT__|$script|g" \
+      -e "s|__HOME__|$HOME|g" \
+      -e "s|__PATH__|$LAUNCH_PATH|g" \
+      "$src" > "$dst"
+    plutil -lint "$dst" >/dev/null || fail "plutil rejected $dst"
+  fi
+}
+
+load_agent() {
+  local label="$1" plist="$2"
+  info "loading LaunchAgent ($label)"
+  if [ "$DRY_RUN" -eq 0 ]; then
+    launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+    if ! launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null; then
+      warn "bootstrap failed for $label, falling back to legacy 'launchctl load'"
+      launchctl load "$plist"
+    fi
+  fi
+}
+
+install_script "$SCRIPT_DIR/bin/start-claude-telegram.sh" "$SCRIPT_DST"
+install_script "$SCRIPT_DIR/bin/watchdog.sh" "$WATCHDOG_DST"
+
+render_plist "$SCRIPT_DIR/launchd/com.user.claude-telegram.plist.template" \
+  "$PLIST_DST" "$LABEL" "$SCRIPT_DST"
+render_plist "$SCRIPT_DIR/launchd/com.user.claude-telegram-watchdog.plist.template" \
+  "$WATCHDOG_PLIST_DST" "$WATCHDOG_LABEL" "$WATCHDOG_DST"
 
 if [ "$NO_LOAD" -eq 1 ]; then
   warn "skipping launchctl (--no-load)"
 else
-  info "loading LaunchAgent ($LABEL)"
-  if [ "$DRY_RUN" -eq 0 ]; then
-    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-    if ! launchctl bootstrap "gui/$(id -u)" "$PLIST_DST" 2>/dev/null; then
-      warn "bootstrap failed, falling back to legacy 'launchctl load'"
-      launchctl load "$PLIST_DST"
-    fi
-  fi
+  load_agent "$LABEL" "$PLIST_DST"
+  load_agent "$WATCHDOG_LABEL" "$WATCHDOG_PLIST_DST"
 fi
 
 cat <<EOF
 
 ✅ Installed.
 
-  Script:      $SCRIPT_DST
-  Config:      $CONFIG_DST
-  LaunchAgent: $PLIST_DST
-  Logs:        $LOGS_DIR/claude-telegram*.log
+  Script:               $SCRIPT_DST
+  Watchdog:             $WATCHDOG_DST
+  Config:               $CONFIG_DST
+  LaunchAgent:          $PLIST_DST
+  Watchdog LaunchAgent: $WATCHDOG_PLIST_DST
+  Logs:                 $LOGS_DIR/claude-telegram*.log
 
 To test now (will pop the confirmation dialog):
   $SCRIPT_DST
 
 To attach to the running session:
   tmux attach -t claude-tg
+
+The watchdog runs every 60s in the background. Logs:
+  tail -f $LOGS_DIR/claude-telegram-watchdog.log
 
 To uninstall:
   $SCRIPT_DIR/uninstall.sh

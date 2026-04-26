@@ -19,6 +19,23 @@ if [ -f "$CONFIG_FILE" ]; then
   source "$CONFIG_FILE"
 fi
 
+# WATCHDOG=1 → skip the macOS confirmation dialog (used by the watchdog
+# when restarting after a detected hang).
+WATCHDOG="${WATCHDOG:-0}"
+
+# Returns PIDs of all bun processes whose cwd is inside the telegram
+# plugin cache (more reliable than command-line matching, since bun's
+# argv shows /private/tmp/bun-node-*/bun without the plugin path).
+find_plugin_bun_pids() {
+  local pid cwd
+  for pid in $(pgrep bun 2>/dev/null); do
+    cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | awk '/^n/{print substr($0,2); exit}')
+    case "$cwd" in
+      *claude-plugins-official/telegram*) printf '%s\n' "$pid" ;;
+    esac
+  done
+}
+
 TMUX_BIN="${TMUX_BIN:-$(command -v tmux 2>/dev/null || true)}"
 CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude 2>/dev/null || true)}"
 
@@ -66,8 +83,30 @@ if [ -f "$BOT_PID_FILE" ]; then
   fi
 fi
 
-log "showing dialog (timeout ${DIALOG_TIMEOUT}s)"
-RESPONSE=$(/usr/bin/osascript <<APPLESCRIPT 2>/dev/null || echo "error"
+# Sweep stray bun processes from the telegram plugin: orphans from prior
+# claude sessions race the live bot on getUpdates and can hold half-open
+# sockets indefinitely. bot.pid only tracks the most recent spawn.
+ORPHANS=$(find_plugin_bun_pids | tr '\n' ' ')
+if [ -n "$ORPHANS" ]; then
+  log "killing leftover plugin bun processes: $ORPHANS"
+  # shellcheck disable=SC2086
+  kill -TERM $ORPHANS 2>/dev/null || true
+  sleep 1
+  STILL=$(find_plugin_bun_pids | tr '\n' ' ')
+  if [ -n "$STILL" ]; then
+    log "force-killing stragglers: $STILL"
+    # shellcheck disable=SC2086
+    kill -KILL $STILL 2>/dev/null || true
+  fi
+  rm -f "$BOT_PID_FILE"
+fi
+
+if [ "$WATCHDOG" = "1" ]; then
+  log "WATCHDOG=1 — skipping confirmation dialog"
+  RESPONSE="start"
+else
+  log "showing dialog (timeout ${DIALOG_TIMEOUT}s)"
+  RESPONSE=$(/usr/bin/osascript <<APPLESCRIPT 2>/dev/null || echo "error"
 try
   tell application "System Events" to activate
   set r to display dialog "Ready to start Claude Telegram session?" buttons {"Skip", "Start"} default button "Start" with title "Claude Telegram" giving up after ${DIALOG_TIMEOUT}
@@ -80,7 +119,8 @@ on error
   return "error"
 end try
 APPLESCRIPT
-)
+  )
+fi
 
 if [ "$RESPONSE" != "start" ]; then
   log "user response: '$RESPONSE' — not starting"
