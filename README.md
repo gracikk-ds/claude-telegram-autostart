@@ -34,7 +34,7 @@ keep the claude session running somewhere.
 ## Quick start
 
 ```sh
-git clone https://github.com/<you>/claude-telegram-autostart.git
+git clone https://github.com/gracikk-ds/claude-telegram-autostart.git
 cd claude-telegram-autostart
 ./install.sh
 ```
