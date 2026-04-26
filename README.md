@@ -11,6 +11,9 @@ at macOS login — no terminal window, just a native confirmation dialog.
 - A native macOS dialog asks **"Ready to start Claude Telegram session?"** (auto-dismisses after 30s).
 - On confirm, it spawns `claude --channels plugin:telegram@claude-plugins-official` inside a **detached `tmux` session** — no visible window.
 - You can `tmux attach -t claude-tg` any time to inspect or interact.
+- A second LaunchAgent runs a **watchdog every 60s** that detects silent
+  hangs (e.g. half-open TCP after a VPN re-handshake) and recovers the
+  session — SIGHUP first, full restart as fallback.
 
 ## Why not just run claude in the background?
 
@@ -60,11 +63,30 @@ login
   └─ launchd (RunAtLoad, Aqua-only)
        └─ ~/.local/bin/start-claude-telegram.sh
             ├─ guards: deps present? tmux session already up? bot.pid alive?
+            ├─ sweep stray bun server.ts orphans (prior-session zombies)
             ├─ osascript display dialog ───── user clicks Start ─┐
             └─ tmux new-session -d -s claude-tg ────────────────┘
                  └─ claude --channels plugin:telegram@claude-plugins-official
                       └─ spawns bun MCP server (Telegram bot)
+
+every 60s
+  └─ launchd (StartInterval=60)
+       └─ ~/.local/bin/claude-telegram-watchdog.sh
+            ├─ skip if no tmux session (user-initiated stop)
+            ├─ skip if api.telegram.org unreachable (real network outage)
+            ├─ check: bot pid alive + ESTABLISHED TCP to telegram CIDR
+            └─ on 2nd consecutive failure: SIGHUP bot → if no recovery,
+               kill tmux + re-run start script with WATCHDOG=1
 ```
+
+### When does this fire?
+
+The most common silent failure mode for the Telegram bridge is a
+half-open TCP socket after the underlying VPN/WireGuard tunnel
+re-handshakes (NAT mapping changes, peer rotates). The plugin's
+long-poll `getUpdates` blocks forever on the dead socket because the
+TCP stack never sees a FIN/RST. The watchdog detects this in <2 minutes
+and restarts cleanly.
 
 ## Configuration
 
@@ -84,11 +106,14 @@ Changes take effect on next launch (no need to reload the LaunchAgent).
 
 ## Logs & debugging
 
-| File                                            | What it contains                            |
-|-------------------------------------------------|---------------------------------------------|
-| `~/Library/Logs/claude-telegram.log`            | Runtime script log (timestamps, decisions). |
-| `~/Library/Logs/claude-telegram-launchd.log`    | LaunchAgent stdout (script output).         |
-| `~/Library/Logs/claude-telegram-launchd.err.log`| LaunchAgent stderr.                         |
+| File                                                       | What it contains                                       |
+|------------------------------------------------------------|--------------------------------------------------------|
+| `~/Library/Logs/claude-telegram.log`                       | Runtime script log (timestamps, decisions).            |
+| `~/Library/Logs/claude-telegram-launchd.log`               | LaunchAgent stdout (script output).                    |
+| `~/Library/Logs/claude-telegram-launchd.err.log`           | LaunchAgent stderr.                                    |
+| `~/Library/Logs/claude-telegram-watchdog.log`              | Watchdog probe results, strikes, recovery actions.     |
+| `~/Library/Logs/claude-telegram-watchdog-launchd.log`      | Watchdog LaunchAgent stdout.                           |
+| `~/Library/Logs/claude-telegram-watchdog-launchd.err.log`  | Watchdog LaunchAgent stderr.                           |
 
 Inspect the live session:
 
@@ -125,3 +150,24 @@ session is detached. Use `tmux attach -t claude-tg` to see it.
 
 **Stale `bot.pid` after a crash.** The script detects this via `kill -0` and
 proceeds anyway. If anything looks off, `rm ~/.claude/channels/telegram/bot.pid`.
+
+**Bot stops responding even though tmux is alive.** Almost always a half-
+open TCP socket after a VPN re-handshake. The watchdog auto-recovers
+within ~2 minutes; tail `~/Library/Logs/claude-telegram-watchdog.log` to
+confirm. If you're on **WireGuard / AmneziaWG / OpenVPN over UDP**, the
+single highest-leverage prevention is to set
+`PersistentKeepalive = 25` under the relevant `[Peer]` in your tunnel
+config — this keeps the UDP NAT mapping warm and prevents the silent
+re-NAT that breaks tunnelled TCP in the first place. The watchdog is
+the safety net for everything else (Wi-Fi roams, Sleep/Wake, ISP blips).
+
+**Watchdog keeps thrashing the session.** Check the log: if every probe
+fails with "no ESTABLISHED TCP to telegram CIDR":
+
+- **WireGuard / AmneziaWG tunnel?** A too-high MTU (default 1420) causes
+  PMTU blackholing — large TLS server certificates are silently dropped,
+  making every HTTPS handshake hang until timeout. Fix: set `MTU = 1280`
+  in the `[Interface]` section of your tunnel config and reconnect.
+
+- **Bot genuinely broken?** Capture a stack trace before the next restart
+  (`sample <pid> 5 -file /tmp/bun.sample`) and file an upstream issue.
