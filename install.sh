@@ -57,11 +57,20 @@ run() {
 
 TMUX_BIN="$(command -v tmux || true)"
 CLAUDE_BIN="$(command -v claude || true)"
+BUN_BIN="$(command -v bun || true)"
 [ -n "$TMUX_BIN" ]   || fail "tmux not found in PATH. Install: brew install tmux"
 [ -n "$CLAUDE_BIN" ] || fail "claude not found in PATH. Install Claude Code first."
 
 info "tmux:   $TMUX_BIN"
 info "claude: $CLAUDE_BIN"
+# bun is invoked by the telegram plugin (not by us), so a missing bun
+# only surfaces at first session start. Warn early instead of failing.
+if [ -z "$BUN_BIN" ]; then
+  warn "bun not found in PATH — the telegram plugin will fail to start."
+  warn "Install before first session: brew install bun"
+else
+  info "bun:    $BUN_BIN"
+fi
 
 if [ -z "${PROJECT_DIR:-}" ]; then
   if [ "$NON_INTERACTIVE" -eq 1 ]; then

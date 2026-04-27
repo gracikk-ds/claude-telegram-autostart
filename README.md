@@ -29,10 +29,27 @@ keep the claude session running somewhere.
 ## Requirements
 
 - macOS 13+
+- [Homebrew](https://brew.sh) — used to install the binaries below into a
+  PATH the LaunchAgent already knows about (`/opt/homebrew/bin` on Apple
+  Silicon, `/usr/local/bin` on Intel; both are pre-baked into the
+  generated plist).
 - [`tmux`](https://github.com/tmux/tmux) — `brew install tmux`
+- [`bun`](https://bun.sh) — `brew install bun`. The Telegram channel's
+  MCP server runs under bun; claude spawns it as
+  `bun run --cwd ~/.claude/plugins/cache/.../telegram/<ver> ...`, so
+  `bun` must be on the LaunchAgent's PATH (Homebrew location is fine;
+  custom locations need a matching `PATH` override in `config.env` or
+  the plist).
 - [Claude Code CLI](https://claude.ai/code) with the `claude-plugins-official`
   marketplace installed and the `telegram` channel configured (run
-  `/telegram:configure` inside a claude session first).
+  `/telegram:configure` inside a claude session first to set the bot
+  token from BotFather and seed `~/.claude/channels/telegram/`).
+
+`install.sh` enforces the macOS / `tmux` / `claude` checks and aborts
+with a clear message if any are missing. `bun` is checked indirectly —
+the install will succeed without it, but the first claude session will
+crash on plugin load. If that happens, install bun and re-run
+`./install.sh` (idempotent).
 
 ## Quick start
 
