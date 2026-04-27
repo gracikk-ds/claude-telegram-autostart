@@ -47,12 +47,38 @@ STRIKE_THRESHOLD=2
 SIGHUP_GRACE_SECONDS=10
 PROBE_TIMEOUT_SECONDS=5
 STALE_LOCK_SECONDS=600
+# Heartbeat: log a single "still alive" line at most once per this many
+# seconds during normal steady-state operation. Without this, a 1-line
+# `probe: ok` per minute would balloon the log to ~30 MB/year of pure
+# noise and bury real events. State transitions (failure, recovery,
+# foreign bot, recovery action) are always logged immediately and
+# bypass this throttle.
+HEARTBEAT_INTERVAL_SECONDS=3600
 TELEGRAM_CIDR_REGEX='149\.154\.|91\.108\.'
 PLUGIN_CWD_SUBSTR='claude-plugins-official/telegram'
 
 mkdir -p "$(dirname "$WATCHDOG_LOG")" "$(dirname "$STATE_FILE")"
 
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$WATCHDOG_LOG"; }
+
+# Emit a heartbeat line only if no log line was written in the last
+# HEARTBEAT_INTERVAL_SECONDS. We piggyback on the log file's mtime
+# instead of carrying a separate timestamp file: any log line — real
+# event or previous heartbeat — postpones the next heartbeat. Real
+# events are more informative than "still alive", so suppressing a
+# heartbeat right after one is desirable.
+log_heartbeat_if_due() {
+  local mtime now
+  if [ ! -s "$WATCHDOG_LOG" ]; then
+    log "$1"
+    return
+  fi
+  mtime=$(stat -f %m "$WATCHDOG_LOG" 2>/dev/null || echo 0)
+  now=$(date +%s)
+  if [ $(( now - mtime )) -ge "$HEARTBEAT_INTERVAL_SECONDS" ]; then
+    log "$1"
+  fi
+}
 
 # Single-flight via mkdir (atomic on macOS, no flock needed). If a stale
 # lock dir is left behind by a crashed run older than STALE_LOCK_SECONDS,
@@ -183,7 +209,9 @@ probe() {
     log "probe: bot pid=$BOT_PID has no ESTABLISHED TCP to telegram CIDR"
     return 1
   fi
-  log "probe: ok (pid=$BOT_PID, telegram socket established)"
+  # Successful probes are intentionally silent — main() decides whether
+  # this tick is a recovery transition (always logged) or steady-state
+  # (heartbeat-throttled).
   return 0
 }
 
@@ -234,30 +262,38 @@ hard_restart() {
 }
 
 main() {
+  # Read strikes once up-front so the success branch can detect a
+  # recovery transition (strikes>0 → ok) and log it explicitly.
+  local strikes
+  strikes=$(read_strikes)
+  # Clamp: an empty or corrupt state file would crash $(()) under set -e.
+  [[ "$strikes" =~ ^[0-9]+$ ]] || strikes=0
+
   if ! tmux_session_alive; then
-    log "no live tmux session '$TMUX_SESSION' — idle (user-initiated stop?)"
+    log_heartbeat_if_due "no live tmux session '$TMUX_SESSION' — idle (user-initiated stop?)"
     reset_strikes
     exit 0
   fi
   if ! network_can_reach_telegram; then
-    log "network can't reach api.telegram.org — VPN/ISP down, skipping"
+    log_heartbeat_if_due "network can't reach api.telegram.org — VPN/ISP down, skipping"
     # Do not increment strikes during a real network outage.
     exit 0
   fi
   classify_bot
   if [ "$BOT_STATUS" = "foreign" ]; then
-    log "foreign bun in bot.pid=$BOT_PID — not a descendant of our tmux pane. Likely a parallel MCP runner (Cursor's ~/.cursor/mcp.json telegram entry?) racing for getUpdates. Refusing to recover (would either no-op or kill another app's process); close the other instance."
+    log_heartbeat_if_due "foreign bun in bot.pid=$BOT_PID — not a descendant of our tmux pane. Likely a parallel MCP runner (Cursor's ~/.cursor/mcp.json telegram entry?) racing for getUpdates. Refusing to recover (would either no-op or kill another app's process); close the other instance."
     reset_strikes
     exit 0
   fi
   if probe; then
+    if [ "$strikes" -gt 0 ]; then
+      log "probe: ok (pid=$BOT_PID) — recovered after $strikes strike(s)"
+    else
+      log_heartbeat_if_due "probe: ok (pid=$BOT_PID) — heartbeat"
+    fi
     reset_strikes
     exit 0
   fi
-  local strikes
-  strikes=$(read_strikes)
-  # Clamp: an empty or corrupt state file would crash $(()) under set -e.
-  [[ "$strikes" =~ ^[0-9]+$ ]] || strikes=0
   strikes=$((strikes + 1))
   if [ "$strikes" -lt "$STRIKE_THRESHOLD" ]; then
     log "probe failed — strike $strikes/$STRIKE_THRESHOLD, waiting"
