@@ -7,8 +7,6 @@ set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-$HOME}"
 TMUX_SESSION="${TMUX_SESSION:-claude-tg}"
-TMUX_BIN="${TMUX_BIN:-}"
-CLAUDE_BIN="${CLAUDE_BIN:-}"
 CHANNELS_SPEC="${CHANNELS_SPEC:-plugin:telegram@claude-plugins-official}"
 DIALOG_TIMEOUT="${DIALOG_TIMEOUT:-30}"
 LOG_FILE="${LOG_FILE:-$HOME/Library/Logs/claude-telegram.log}"
@@ -26,6 +24,7 @@ WATCHDOG="${WATCHDOG:-0}"
 # Returns PIDs of all bun processes whose cwd is inside the telegram
 # plugin cache (more reliable than command-line matching, since bun's
 # argv shows /private/tmp/bun-node-*/bun without the plugin path).
+# Mirrors find_plugin_bun_pids() in uninstall.sh — keep both in sync.
 find_plugin_bun_pids() {
   local pid cwd
   for pid in $(pgrep bun 2>/dev/null); do
@@ -45,25 +44,21 @@ log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE"; }
 notify() {
   /usr/bin/osascript -e "display notification \"$1\" with title \"Claude Telegram\"" >/dev/null 2>&1 || true
 }
+die() {
+  log "FAIL: $1"
+  notify "$2"
+  exit 1
+}
 
 log "=== invoked ==="
 log "PROJECT_DIR=$PROJECT_DIR TMUX_SESSION=$TMUX_SESSION CHANNELS_SPEC=$CHANNELS_SPEC"
 
-if [ -z "$TMUX_BIN" ] || [ ! -x "$TMUX_BIN" ]; then
-  log "FAIL: tmux not found (TMUX_BIN='$TMUX_BIN')"
-  notify "tmux missing — brew install tmux"
-  exit 1
-fi
-if [ -z "$CLAUDE_BIN" ] || [ ! -x "$CLAUDE_BIN" ]; then
-  log "FAIL: claude not found (CLAUDE_BIN='$CLAUDE_BIN')"
-  notify "claude missing — install Claude Code"
-  exit 1
-fi
-if [ ! -d "$PROJECT_DIR" ]; then
-  log "FAIL: PROJECT_DIR does not exist: $PROJECT_DIR"
-  notify "project dir not found: $PROJECT_DIR"
-  exit 1
-fi
+[ -n "$TMUX_BIN" ] && [ -x "$TMUX_BIN" ] \
+  || die "tmux not found (TMUX_BIN='$TMUX_BIN')" "tmux missing — brew install tmux"
+[ -n "$CLAUDE_BIN" ] && [ -x "$CLAUDE_BIN" ] \
+  || die "claude not found (CLAUDE_BIN='$CLAUDE_BIN')" "claude missing — install Claude Code"
+[ -d "$PROJECT_DIR" ] \
+  || die "PROJECT_DIR does not exist: $PROJECT_DIR" "project dir not found: $PROJECT_DIR"
 
 if "$TMUX_BIN" has-session -t "$TMUX_SESSION" 2>/dev/null; then
   log "tmux session '$TMUX_SESSION' already exists — exiting"
@@ -74,7 +69,9 @@ fi
 BOT_PID_FILE="$HOME/.claude/channels/telegram/bot.pid"
 if [ -f "$BOT_PID_FILE" ]; then
   PID=$(cat "$BOT_PID_FILE" 2>/dev/null || true)
-  if [ -n "${PID:-}" ] && kill -0 "$PID" 2>/dev/null; then
+  # Treat anything that isn't a positive integer as stale — never pass
+  # garbage (or 0/-1, which would target the process group) to kill.
+  if [[ "${PID:-}" =~ ^[1-9][0-9]*$ ]] && kill -0 "$PID" 2>/dev/null; then
     log "bot.pid $PID alive — claude session already running, exiting"
     notify "already running (PID $PID)"
     exit 0
@@ -86,17 +83,23 @@ fi
 # Sweep stray bun processes from the telegram plugin: orphans from prior
 # claude sessions race the live bot on getUpdates and can hold half-open
 # sockets indefinitely. bot.pid only tracks the most recent spawn.
-ORPHANS=$(find_plugin_bun_pids | tr '\n' ' ')
-if [ -n "$ORPHANS" ]; then
-  log "killing leftover plugin bun processes: $ORPHANS"
-  # shellcheck disable=SC2086
-  kill -TERM $ORPHANS 2>/dev/null || true
+# macOS /bin/bash is 3.2 — no `mapfile`/`readarray`. Use a portable
+# read loop so the array stays NUL-safe without the bash-4 builtin.
+ORPHANS=()
+while IFS= read -r pid; do
+  [ -n "$pid" ] && ORPHANS+=("$pid")
+done < <(find_plugin_bun_pids)
+if [ "${#ORPHANS[@]}" -gt 0 ]; then
+  log "killing leftover plugin bun processes: ${ORPHANS[*]}"
+  kill -TERM "${ORPHANS[@]}" 2>/dev/null || true
   sleep 1
-  STILL=$(find_plugin_bun_pids | tr '\n' ' ')
-  if [ -n "$STILL" ]; then
-    log "force-killing stragglers: $STILL"
-    # shellcheck disable=SC2086
-    kill -KILL $STILL 2>/dev/null || true
+  STILL=()
+  while IFS= read -r pid; do
+    [ -n "$pid" ] && STILL+=("$pid")
+  done < <(find_plugin_bun_pids)
+  if [ "${#STILL[@]}" -gt 0 ]; then
+    log "force-killing stragglers: ${STILL[*]}"
+    kill -KILL "${STILL[@]}" 2>/dev/null || true
   fi
   rm -f "$BOT_PID_FILE"
 fi
@@ -136,7 +139,5 @@ if "$TMUX_BIN" has-session -t "$TMUX_SESSION" 2>/dev/null; then
   log "session '$TMUX_SESSION' started"
   notify "session started — tmux attach -t $TMUX_SESSION"
 else
-  log "FAIL: session did not start"
-  notify "failed to start (see $LOG_FILE)"
-  exit 1
+  die "session did not start" "failed to start (see $LOG_FILE)"
 fi

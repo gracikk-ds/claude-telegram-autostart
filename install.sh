@@ -110,7 +110,7 @@ TMUX_BIN="$TMUX_BIN"
 CLAUDE_BIN="$CLAUDE_BIN"
 CHANNELS_SPEC="plugin:telegram@claude-plugins-official"
 DIALOG_TIMEOUT=30
-LOG_FILE="\$HOME/Library/Logs/claude-telegram.log"
+LOG_FILE="$HOME/Library/Logs/claude-telegram.log"
 EOF
   fi
 fi
@@ -152,9 +152,20 @@ load_agent() {
   local label="$1" plist="$2"
   info "loading LaunchAgent ($label)"
   if [ "$DRY_RUN" -eq 0 ]; then
-    launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
-    if ! launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null; then
-      warn "bootstrap failed for $label, falling back to legacy 'launchctl load'"
+    local bootout_err
+    if ! bootout_err=$(launchctl bootout "gui/$(id -u)/$label" 2>&1); then
+      # "Could not find specified service" / "No such process" is the
+      # expected outcome when the agent isn't loaded yet — only surface
+      # other failures so we don't hide real permission/SIP errors.
+      case "$bootout_err" in
+        *"Could not find specified service"*|*"No such process"*|"") ;;
+        *) warn "bootout returned: $bootout_err" ;;
+      esac
+    fi
+    local bootstrap_err
+    if ! bootstrap_err=$(launchctl bootstrap "gui/$(id -u)" "$plist" 2>&1); then
+      warn "bootstrap failed for $label: ${bootstrap_err:-no stderr}"
+      warn "falling back to legacy 'launchctl load'"
       launchctl load "$plist"
     fi
   fi

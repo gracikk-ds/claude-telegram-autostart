@@ -63,7 +63,7 @@ login
   └─ launchd (RunAtLoad, Aqua-only)
        └─ ~/.local/bin/start-claude-telegram.sh
             ├─ guards: deps present? tmux session already up? bot.pid alive?
-            ├─ sweep stray bun server.ts orphans (prior-session zombies)
+            ├─ sweep stray plugin bun orphans (matched by cwd; prior-session zombies)
             ├─ osascript display dialog ───── user clicks Start ─┐
             └─ tmux new-session -d -s claude-tg ────────────────┘
                  └─ claude --channels plugin:telegram@claude-plugins-official

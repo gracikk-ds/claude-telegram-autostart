@@ -18,28 +18,35 @@
 set -euo pipefail
 
 # Source the shared config FIRST so that variables it sets (TMUX_SESSION,
-# TMUX_BIN) are available, but the watchdog's own paths are set AFTER —
-# config.env defines a LOG_FILE for the start script, and we don't want
-# to inherit it.
+# TMUX_BIN) are available. Then drop the start-script's LOG_FILE so we
+# can never accidentally write watchdog history into it — our own log
+# lives at WATCHDOG_LOG below.
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-telegram-autostart/config.env"
 if [ -f "$CONFIG_FILE" ]; then
   # shellcheck disable=SC1090
   source "$CONFIG_FILE"
 fi
+unset LOG_FILE
 
 TMUX_SESSION="${TMUX_SESSION:-claude-tg}"
 TMUX_BIN="${TMUX_BIN:-$(command -v tmux 2>/dev/null || true)}"
 START_SCRIPT="${START_SCRIPT:-$HOME/.local/bin/start-claude-telegram.sh}"
-WATCHDOG_LOG="${WATCHDOG_LOG:-$HOME/Library/Logs/claude-telegram-watchdog.log}"
-STATE_FILE="${WATCHDOG_STATE_FILE:-$HOME/.claude/channels/telegram/watchdog.state}"
-LOCK_DIR="${WATCHDOG_LOCK_DIR:-$HOME/.claude/channels/telegram/watchdog.lock.d}"
+# Watchdog-specific paths: the WATCHDOG_-prefixed names below are
+# intentionally distinct from the start-script's LOG_FILE so a mistaken
+# entry in config.env cannot redirect us. Edit this script if you need
+# to relocate them.
+WATCHDOG_LOG="$HOME/Library/Logs/claude-telegram-watchdog.log"
+STATE_FILE="$HOME/.claude/channels/telegram/watchdog.state"
+LOCK_DIR="$HOME/.claude/channels/telegram/watchdog.lock.d"
 BOT_PID_FILE="$HOME/.claude/channels/telegram/bot.pid"
 
-# Two consecutive bad probes (~120s) before we act — gives grammy a
-# chance to reconnect on its own during transient blips.
+# Two consecutive bad probes (~120s, assuming the launchd StartInterval=60
+# in the watchdog plist) before we act — gives grammy a chance to
+# reconnect on its own during transient blips.
 STRIKE_THRESHOLD=2
 SIGHUP_GRACE_SECONDS=10
 PROBE_TIMEOUT_SECONDS=5
+STALE_LOCK_SECONDS=600
 TELEGRAM_CIDR_REGEX='149\.154\.|91\.108\.'
 PLUGIN_CWD_SUBSTR='claude-plugins-official/telegram'
 
@@ -48,14 +55,15 @@ mkdir -p "$(dirname "$WATCHDOG_LOG")" "$(dirname "$STATE_FILE")"
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$WATCHDOG_LOG"; }
 
 # Single-flight via mkdir (atomic on macOS, no flock needed). If a stale
-# lock dir is left behind by a crashed run older than 10 minutes, claim it.
+# lock dir is left behind by a crashed run older than STALE_LOCK_SECONDS,
+# claim it.
 acquire_lock() {
   if mkdir "$LOCK_DIR" 2>/dev/null; then
     return 0
   fi
   local age_secs
   age_secs=$(( $(date +%s) - $(stat -f %m "$LOCK_DIR" 2>/dev/null || echo 0) ))
-  if [ "$age_secs" -gt 600 ]; then
+  if [ "$age_secs" -gt "$STALE_LOCK_SECONDS" ]; then
     log "stale lock dir ($age_secs s) — reclaiming"
     rm -rf "$LOCK_DIR"
     mkdir "$LOCK_DIR" 2>/dev/null || return 1
@@ -67,14 +75,12 @@ if ! acquire_lock; then
   log "previous watchdog run still active — skipping"
   exit 0
 fi
-trap 'rm -rf "$LOCK_DIR"' EXIT
+# Cover SIGTERM/SIGINT/SIGHUP too so a launchd-killed run doesn't leak
+# the lock dir until the stale-lock window expires.
+trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM HUP
 
 read_strikes() {
-  if [ -f "$STATE_FILE" ]; then
-    cat "$STATE_FILE" 2>/dev/null || echo 0
-  else
-    echo 0
-  fi
+  cat "$STATE_FILE" 2>/dev/null || echo 0
 }
 
 write_strikes() {
@@ -115,45 +121,35 @@ is_descendant() {
   return 1
 }
 
-bot_pid() {
-  [ -f "$BOT_PID_FILE" ] || return 1
+# Inspect bot.pid and decide which of three states we're in. Sets the
+# globals BOT_PID and BOT_STATUS:
+#   ours    — live plugin bun, descendant of our tmux pane's claude
+#   foreign — live plugin bun, but spawned by a different app (e.g.
+#             Cursor with telegram in ~/.cursor/mcp.json) — racing us
+#             for getUpdates; we must NOT SIGHUP or kill it
+#   absent  — file missing, contents invalid, process dead, or wrong cwd
+classify_bot() {
+  BOT_PID=""
+  BOT_STATUS="absent"
+  [ -f "$BOT_PID_FILE" ] || return 0
   local pid cwd pane_pid
   pid=$(cat "$BOT_PID_FILE" 2>/dev/null || true)
-  [ -n "$pid" ] || return 1
-  kill -0 "$pid" 2>/dev/null || return 1
-  # Verify the process really is our bot — guards against PID recycling.
+  # Treat anything that isn't a positive integer as absent — never pass
+  # garbage (or 0/-1, which would target the process group) to kill.
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 0
+  kill -0 "$pid" 2>/dev/null || return 0
   cwd=$(pid_cwd "$pid")
   case "$cwd" in
     *"$PLUGIN_CWD_SUBSTR"*) ;;
-    *) return 1 ;;
+    *) return 0 ;;
   esac
-  # Verify the bun is a descendant of OUR tmux pane's claude. Otherwise
-  # bot.pid points at a parallel MCP runner (e.g. Cursor with the
-  # telegram plugin in ~/.cursor/mcp.json) — we must not SIGHUP it, and
-  # main() handles that case before calling probe.
-  pane_pid=$(tmux_pane_pid) || return 1
-  is_descendant "$pid" "$pane_pid" || return 1
-  printf '%s' "$pid"
-}
-
-# True iff bot.pid points to a live plugin bun process that is NOT a
-# descendant of our tmux pane's claude. Catches the case where another
-# app (most commonly Cursor with telegram in ~/.cursor/mcp.json) has
-# spawned its own bun for the same plugin and is winning the
-# getUpdates race for the bot token.
-bot_is_foreign() {
-  [ -f "$BOT_PID_FILE" ] || return 1
-  local pid cwd pane_pid
-  pid=$(cat "$BOT_PID_FILE" 2>/dev/null || true)
-  [ -n "$pid" ] || return 1
-  kill -0 "$pid" 2>/dev/null || return 1
-  cwd=$(pid_cwd "$pid")
-  case "$cwd" in
-    *"$PLUGIN_CWD_SUBSTR"*) ;;
-    *) return 1 ;;
-  esac
-  pane_pid=$(tmux_pane_pid) || return 1
-  ! is_descendant "$pid" "$pane_pid"
+  pane_pid=$(tmux_pane_pid) || return 0
+  BOT_PID="$pid"
+  if is_descendant "$pid" "$pane_pid"; then
+    BOT_STATUS="ours"
+  else
+    BOT_STATUS="foreign"
+  fi
 }
 
 has_established_to_telegram() {
@@ -178,28 +174,30 @@ tmux_session_alive() {
 }
 
 probe() {
-  local pid
-  if ! pid=$(bot_pid); then
+  classify_bot
+  if [ "$BOT_STATUS" != "ours" ]; then
     log "probe: no live bot process"
     return 1
   fi
   if ! has_established_to_telegram; then
-    log "probe: bot pid=$pid has no ESTABLISHED TCP to telegram CIDR"
+    log "probe: bot pid=$BOT_PID has no ESTABLISHED TCP to telegram CIDR"
     return 1
   fi
-  log "probe: ok (pid=$pid, telegram socket established)"
+  log "probe: ok (pid=$BOT_PID, telegram socket established)"
   return 0
 }
 
 soft_restart() {
-  local pid
-  pid=$(bot_pid) || pid=""
-  if [ -z "$pid" ]; then
+  if [ "$BOT_STATUS" != "ours" ] || [ -z "$BOT_PID" ]; then
     log "soft_restart: no bot pid to SIGHUP, escalating"
     return 1
   fi
-  log "soft_restart: SIGHUP → pid=$pid"
-  kill -HUP "$pid" 2>/dev/null || true
+  log "soft_restart: SIGHUP → pid=$BOT_PID"
+  local err
+  if ! err=$(kill -HUP "$BOT_PID" 2>&1); then
+    log "soft_restart: SIGHUP failed: ${err:-unknown error}"
+    return 1
+  fi
   sleep "$SIGHUP_GRACE_SECONDS"
   if probe; then
     log "soft_restart: succeeded after SIGHUP"
@@ -212,10 +210,17 @@ soft_restart() {
 hard_restart() {
   log "hard_restart: kill tmux session '$TMUX_SESSION' and re-run start script"
   if [ -n "$TMUX_BIN" ] && [ -x "$TMUX_BIN" ]; then
-    "$TMUX_BIN" kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+    local kill_err
+    if ! kill_err=$("$TMUX_BIN" kill-session -t "$TMUX_SESSION" 2>&1); then
+      case "$kill_err" in
+        *"can't find session"*|*"no server"*|"") ;;
+        *) log "hard_restart: tmux kill-session warning: $kill_err" ;;
+      esac
+    fi
   fi
-  # start-claude-telegram.sh sweeps stray bun server.ts itself when
-  # invoked, so we just ensure bot.pid is gone and call it.
+  # start-claude-telegram.sh's find_plugin_bun_pids() sweeps stray plugin
+  # bun processes (matched by cwd) when invoked, so we just ensure
+  # bot.pid is gone and call it.
   rm -f "$BOT_PID_FILE"
   if [ ! -x "$START_SCRIPT" ]; then
     log "hard_restart: FAIL — start script not executable: $START_SCRIPT"
@@ -239,10 +244,9 @@ main() {
     # Do not increment strikes during a real network outage.
     exit 0
   fi
-  if bot_is_foreign; then
-    local foreign_pid
-    foreign_pid=$(cat "$BOT_PID_FILE" 2>/dev/null || true)
-    log "foreign bun in bot.pid=$foreign_pid — not a descendant of our tmux pane. Likely a parallel MCP runner (Cursor's ~/.cursor/mcp.json telegram entry?) racing for getUpdates. Refusing to recover (would either no-op or kill another app's process); close the other instance."
+  classify_bot
+  if [ "$BOT_STATUS" = "foreign" ]; then
+    log "foreign bun in bot.pid=$BOT_PID — not a descendant of our tmux pane. Likely a parallel MCP runner (Cursor's ~/.cursor/mcp.json telegram entry?) racing for getUpdates. Refusing to recover (would either no-op or kill another app's process); close the other instance."
     reset_strikes
     exit 0
   fi
@@ -252,6 +256,8 @@ main() {
   fi
   local strikes
   strikes=$(read_strikes)
+  # Clamp: an empty or corrupt state file would crash $(()) under set -e.
+  [[ "$strikes" =~ ^[0-9]+$ ]] || strikes=0
   strikes=$((strikes + 1))
   if [ "$strikes" -lt "$STRIKE_THRESHOLD" ]; then
     log "probe failed — strike $strikes/$STRIKE_THRESHOLD, waiting"

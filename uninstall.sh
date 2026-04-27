@@ -102,25 +102,46 @@ if [ "$NON_INTERACTIVE" -eq 0 ]; then
     echo "Telegram bot token and allowlist in $CHANNEL_DIR are preserved (use --purge to wipe)."
   fi
   printf 'Continue? [y/N] '
-  ans=""
   read -r ans || true
-  case "$ans" in y|Y|yes) ;; *) info "aborted"; exit 0 ;; esac
+  case "${ans:-}" in y|Y|yes) ;; *) info "aborted"; exit 0 ;; esac
 fi
+
+remove_files() {
+  local f
+  for f in "$@"; do
+    if [ -e "$f" ]; then
+      info "removing $f"
+      rm -f "$f"
+    fi
+  done
+}
 
 # --- 1. Unload LaunchAgents (idempotent) ---------------------------------
 unload_agent() {
   local label="$1" plist="$2"
   info "unloading LaunchAgent ($label)"
-  launchctl bootout "gui/$(id -u)/$label" 2>/dev/null \
-    || launchctl unload "$plist" 2>/dev/null \
-    || true
+  local bootout_err unload_err
+  if bootout_err=$(launchctl bootout "gui/$(id -u)/$label" 2>&1); then
+    return 0
+  fi
+  case "$bootout_err" in
+    *"Could not find specified service"*|*"No such process"*|"")
+      # Not loaded — nothing to do.
+      return 0 ;;
+  esac
+  if [ -f "$plist" ] && unload_err=$(launchctl unload "$plist" 2>&1); then
+    return 0
+  fi
+  warn "agent $label may still be loaded — bootout: ${bootout_err:-?}${unload_err:+ ; unload: $unload_err}"
 }
 unload_agent "$WATCHDOG_LABEL" "$WATCHDOG_PLIST_DST"
 unload_agent "$LABEL" "$PLIST_DST"
 
 # --- 2. Kill plugin bun processes (orphans from any prior session) -------
-# Identify by cwd, since `bun` argv shows /private/tmp/bun-node-*/bun
-# without the plugin path. This catches zombies the plist guard misses.
+# Identify by cwd (bun's argv is /private/tmp/bun-node-*/bun, no plugin
+# path). Mirrors find_plugin_bun_pids() in bin/start-claude-telegram.sh
+# — keep both in sync. Catches zombies the start script's bot.pid
+# liveness check would miss.
 find_plugin_bun_pids() {
   local pid cwd
   for pid in $(pgrep bun 2>/dev/null); do
@@ -131,17 +152,23 @@ find_plugin_bun_pids() {
   done
 }
 
-ORPHANS=$(find_plugin_bun_pids | tr '\n' ' ')
-if [ -n "$ORPHANS" ]; then
-  info "killing plugin bun processes: $ORPHANS"
-  # shellcheck disable=SC2086
-  kill -TERM $ORPHANS 2>/dev/null || true
+# macOS /bin/bash is 3.2 — no `mapfile`/`readarray`. Use a portable
+# read loop so the array stays NUL-safe without the bash-4 builtin.
+ORPHANS=()
+while IFS= read -r pid; do
+  [ -n "$pid" ] && ORPHANS+=("$pid")
+done < <(find_plugin_bun_pids)
+if [ "${#ORPHANS[@]}" -gt 0 ]; then
+  info "killing plugin bun processes: ${ORPHANS[*]}"
+  kill -TERM "${ORPHANS[@]}" 2>/dev/null || true
   sleep 1
-  STILL=$(find_plugin_bun_pids | tr '\n' ' ')
-  if [ -n "$STILL" ]; then
-    warn "force-killing stragglers: $STILL"
-    # shellcheck disable=SC2086
-    kill -KILL $STILL 2>/dev/null || true
+  STILL=()
+  while IFS= read -r pid; do
+    [ -n "$pid" ] && STILL+=("$pid")
+  done < <(find_plugin_bun_pids)
+  if [ "${#STILL[@]}" -gt 0 ]; then
+    warn "force-killing stragglers: ${STILL[*]}"
+    kill -KILL "${STILL[@]}" 2>/dev/null || true
   fi
 fi
 
@@ -152,20 +179,10 @@ if [ -n "$TMUX_BIN" ] && "$TMUX_BIN" has-session -t "$TMUX_SESSION" 2>/dev/null;
 fi
 
 # --- 4. Remove installed files -------------------------------------------
-for f in "$WATCHDOG_PLIST_DST" "$WATCHDOG_DST" "$PLIST_DST" "$SCRIPT_DST"; do
-  if [ -e "$f" ]; then
-    info "removing $f"
-    rm -f "$f"
-  fi
-done
+remove_files "$WATCHDOG_PLIST_DST" "$WATCHDOG_DST" "$PLIST_DST" "$SCRIPT_DST"
 
 # --- 5. Remove our state files (leave plugin's own .env/access.json) -----
-for f in "$BOT_PID_FILE" "$WATCHDOG_STATE"; do
-  if [ -e "$f" ]; then
-    info "removing $f"
-    rm -f "$f"
-  fi
-done
+remove_files "$BOT_PID_FILE" "$WATCHDOG_STATE"
 if [ -d "$WATCHDOG_LOCK_DIR" ]; then
   info "removing $WATCHDOG_LOCK_DIR"
   rm -rf "$WATCHDOG_LOCK_DIR"
@@ -173,12 +190,7 @@ fi
 
 # --- 6. Remove logs ------------------------------------------------------
 if [ "$KEEP_LOGS" -eq 0 ]; then
-  for f in "${LOG_FILES[@]}"; do
-    if [ -e "$f" ]; then
-      info "removing $f"
-      rm -f "$f"
-    fi
-  done
+  remove_files "${LOG_FILES[@]}"
 fi
 
 # --- 7. Remove config dir ------------------------------------------------
