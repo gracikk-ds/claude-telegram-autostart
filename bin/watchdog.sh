@@ -89,9 +89,35 @@ pid_cwd() {
   lsof -a -p "$1" -d cwd -Fn 2>/dev/null | awk '/^n/{print substr($0,2); exit}'
 }
 
+tmux_pane_pid() {
+  [ -n "$TMUX_BIN" ] && [ -x "$TMUX_BIN" ] || return 1
+  local pid
+  pid=$("$TMUX_BIN" list-panes -t "$TMUX_SESSION" -F '#{pane_pid}' 2>/dev/null | head -n1)
+  [ -n "$pid" ] || return 1
+  printf '%s' "$pid"
+}
+
+# Walk the ppid chain from $1 upward looking for $2.
+# Depth-bounded so a stat error or unexpected loop can't hang us.
+is_descendant() {
+  local pid=$1 ancestor=$2 depth=0
+  [ -n "$pid" ] && [ -n "$ancestor" ] || return 1
+  while [ "$depth" -lt 20 ]; do
+    if [ "$pid" = "$ancestor" ]; then
+      return 0
+    fi
+    if [ "$pid" = "1" ] || [ "$pid" = "0" ] || [ -z "$pid" ]; then
+      return 1
+    fi
+    pid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')
+    depth=$((depth + 1))
+  done
+  return 1
+}
+
 bot_pid() {
   [ -f "$BOT_PID_FILE" ] || return 1
-  local pid cwd
+  local pid cwd pane_pid
   pid=$(cat "$BOT_PID_FILE" 2>/dev/null || true)
   [ -n "$pid" ] || return 1
   kill -0 "$pid" 2>/dev/null || return 1
@@ -101,7 +127,33 @@ bot_pid() {
     *"$PLUGIN_CWD_SUBSTR"*) ;;
     *) return 1 ;;
   esac
+  # Verify the bun is a descendant of OUR tmux pane's claude. Otherwise
+  # bot.pid points at a parallel MCP runner (e.g. Cursor with the
+  # telegram plugin in ~/.cursor/mcp.json) — we must not SIGHUP it, and
+  # main() handles that case before calling probe.
+  pane_pid=$(tmux_pane_pid) || return 1
+  is_descendant "$pid" "$pane_pid" || return 1
   printf '%s' "$pid"
+}
+
+# True iff bot.pid points to a live plugin bun process that is NOT a
+# descendant of our tmux pane's claude. Catches the case where another
+# app (most commonly Cursor with telegram in ~/.cursor/mcp.json) has
+# spawned its own bun for the same plugin and is winning the
+# getUpdates race for the bot token.
+bot_is_foreign() {
+  [ -f "$BOT_PID_FILE" ] || return 1
+  local pid cwd pane_pid
+  pid=$(cat "$BOT_PID_FILE" 2>/dev/null || true)
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  cwd=$(pid_cwd "$pid")
+  case "$cwd" in
+    *"$PLUGIN_CWD_SUBSTR"*) ;;
+    *) return 1 ;;
+  esac
+  pane_pid=$(tmux_pane_pid) || return 1
+  ! is_descendant "$pid" "$pane_pid"
 }
 
 has_established_to_telegram() {
@@ -185,6 +237,13 @@ main() {
   if ! network_can_reach_telegram; then
     log "network can't reach api.telegram.org — VPN/ISP down, skipping"
     # Do not increment strikes during a real network outage.
+    exit 0
+  fi
+  if bot_is_foreign; then
+    local foreign_pid
+    foreign_pid=$(cat "$BOT_PID_FILE" 2>/dev/null || true)
+    log "foreign bun in bot.pid=$foreign_pid — not a descendant of our tmux pane. Likely a parallel MCP runner (Cursor's ~/.cursor/mcp.json telegram entry?) racing for getUpdates. Refusing to recover (would either no-op or kill another app's process); close the other instance."
+    reset_strikes
     exit 0
   fi
   if probe; then

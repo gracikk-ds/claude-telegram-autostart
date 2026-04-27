@@ -74,7 +74,10 @@ every 60s
        └─ ~/.local/bin/claude-telegram-watchdog.sh
             ├─ skip if no tmux session (user-initiated stop)
             ├─ skip if api.telegram.org unreachable (real network outage)
-            ├─ check: bot pid alive + ESTABLISHED TCP to telegram CIDR
+            ├─ skip if bot.pid points to a foreign bun (parallel MCP
+            │   runner like Cursor's mcp.json racing for getUpdates)
+            ├─ check: bot pid is descendant of our tmux claude
+            │         + ESTABLISHED TCP to telegram CIDR
             └─ on 2nd consecutive failure: SIGHUP bot → if no recovery,
                kill tmux + re-run start script with WATCHDOG=1
 ```
@@ -150,6 +153,16 @@ session is detached. Use `tmux attach -t claude-tg` to see it.
 
 **Stale `bot.pid` after a crash.** The script detects this via `kill -0` and
 proceeds anyway. If anything looks off, `rm ~/.claude/channels/telegram/bot.pid`.
+
+**Bot stops responding but watchdog log says `foreign bun in bot.pid=…`.**
+Another app on the same machine has its own copy of the telegram MCP
+plugin running and is winning the `getUpdates` race for your bot token.
+The most common source is Cursor with the plugin wired into
+`~/.cursor/mcp.json` — close Cursor (or remove the entry), then
+`rm ~/.claude/channels/telegram/bot.pid` and the watchdog will rebuild
+our session on its next tick. To find which app spawned the foreign bun:
+`ps -p $(cat ~/.claude/channels/telegram/bot.pid) -o pid,ppid,command=`,
+then walk the ppid chain.
 
 **Bot stops responding even though tmux is alive.** Almost always a half-
 open TCP socket after a VPN re-handshake. The watchdog auto-recovers
